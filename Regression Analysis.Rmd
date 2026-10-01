@@ -1,0 +1,721 @@
+---
+title: "Analisis OLS, WLS, GLS, dan Ridge Regression"
+subtitle: "Tugas Supervised Learning"
+author: "Mahsa Azzahra"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: readable
+    highlight: tango
+    self_contained: true
+---
+
+<style>
+.main-container p, .main-container li { text-align: justify; }
+</style>
+
+```{r setup, include=FALSE}
+# Pengaturan global chunk
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5)
+
+# Progress knit: tampilkan nama chunk, durasi chunk, dan total waktu di console
+.tm <- new.env()
+.tm$start <- proc.time()[["elapsed"]]
+.tm$last  <- .tm$start
+.hook_asli <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  now <- proc.time()[["elapsed"]]
+  cat(sprintf("[knitr] %-28s | durasi chunk: %6.1f detik | total: %6.1f detik\n",
+              options$label, now - .tm$last, now - .tm$start))
+  .tm$last <- now
+  .hook_asli(x, options)
+})
+```
+
+```{r packages}
+library(data.table)   
+library(car)        
+library(lmtest)      
+
+options(scipen = 999)
+set.seed(123)
+```
+
+# Pendahuluan
+
+Analisis ini membandingkan empat penduga regresi pada data simulasi (1.500.000 observasi, 30 prediktor $X$, 1 respon $Y$):
+
+| Model | Penduga | Masalah yang diatasi |
+|-------------------|-------------------|-----------------------------------|
+| **OLS** | $\hat\beta_{OLS}=(X^TX)^{-1}X^Ty$ | dasar / *baseline* |
+| **WLS** | $\hat\beta_{WLS}=(X^TWX)^{-1}X^TWy$ | heteroskedastisitas |
+| **GLS** | $\hat\beta_{GLS}=(X^T\Omega^{-1}X)^{-1}X^T\Omega^{-1}y$ | heteroskedastisitas dan autokorelasi |
+| **Ridge** | $\hat\beta_{Ridge}=(X^TX+\lambda I)^{-1}X^Ty$ | multikolinearitas dan *overfitting* |
+
+Hubungan ketiganya: GLS adalah bentuk paling umum. Bila $\Omega$ diagonal maka GLS menjadi WLS, dan bila $\Omega \propto I$ maka GLS menjadi OLS. Ridge menjadi OLS saat $\lambda = 0$.
+
+Alur analisis yang akan dilakukan yaitu: **(1)** impor data, **(2)** bagi data training dan testing, **(3)** OLS sebagai model awal, **(4)** uji asumsi sisaan OLS (normalitas, multikolinearitas, heteroskedastisitas, autokorelasi), **(5)** WLS, GLS, Ridge, **(6)** perbandingan dengan RMSE dan AIC.
+
+------------------------------------------------------------------------
+
+# Import Data
+
+```{r import-settings}
+file_path <- "C:/Users/Asus/Downloads/raw_data_simulasi.txt"
+
+cat("File data   :", file_path, "\n")
+cat("Ukuran file :", round(file.size(file_path) / 1024^2, 1), "MB\n")
+```
+
+```{r import-data}
+data_raw <- as.data.frame(fread(file_path, header = TRUE, showProgress = TRUE))
+names(data_raw) <- make.names(names(data_raw), unique = TRUE)
+
+# Respon Y dan prediktor X
+target_col     <- "Y"
+predictor_cols <- setdiff(names(data_raw), target_col)
+
+cat("Dimensi        :", nrow(data_raw), "baris x", ncol(data_raw), "kolom\n")
+cat("Variabel Y     :", target_col, "\n")
+cat("Jumlah X       :", length(predictor_cols), "\n")
+cat("Nama kolom     :", paste(names(data_raw), collapse = ", "), "\n")
+```
+
+```{r data-check}
+# Tipe data dan missing value
+cek_data <- data.frame(Variabel  = names(data_raw),
+                       Tipe      = sapply(data_raw, function(x) class(x)[1]),
+                       Missing   = sapply(data_raw, function(x) sum(is.na(x))),
+                       Missing_Persen = sapply(data_raw, function(x) mean(is.na(x)) * 100),
+                       row.names = NULL)
+knitr::kable(cek_data, digits = 4, caption = "Tipe data dan missing value seluruh kolom")
+
+# Cek duplikat baris
+n_dup <- sum(duplicated(as.data.table(data_raw)))
+cat("Baris duplikat :", n_dup, "\n")
+
+# Pembersihan missing value
+n_awal   <- nrow(data_raw)
+data_raw <- data_raw[complete.cases(data_raw), ]
+cat("Observasi awal:", n_awal, "| setelah membuang missing:", nrow(data_raw),
+    "| dibuang:", n_awal - nrow(data_raw), "\n")
+```
+
+Data memiliki `r format(n_awal, big.mark = ".", decimal.mark = ",")` observasi dan `r length(predictor_cols)` prediktor dengan satu respon `r target_col`. Pemeriksaan pada seluruh kolom menunjukkan **tidak ada missing value** pada prediktor maupun respon, dan **tidak ada baris duplikat**, sehingga seluruh observasi dipakai tanpa ada yang dibuang. Seluruh variabel bertipe numerik sehingga dapat langsung dipakai dalam regresi.
+
+# Statistik Deskriptif
+
+```{r descriptive}
+deskriptif <- data.frame(Variabel = names(data_raw),
+                         Mean   = sapply(data_raw, mean),
+                         SD     = sapply(data_raw, sd),
+                         Min    = sapply(data_raw, min),
+                         Median = sapply(data_raw, median),
+                         Max    = sapply(data_raw, max),
+                         row.names = NULL)
+knitr::kable(deskriptif, digits = 4, caption = "Statistik deskriptif seluruh variabel")
+```
+
+```{r desc-values, include=FALSE}
+dx <- deskriptif[deskriptif$Variabel != target_col, ]   # prediktor
+dy <- deskriptif[deskriptif$Variabel == target_col, ]   # respon
+```
+
+Seluruh prediktor memiliki rata-rata mendekati nol (`r round(min(dx$Mean), 3)` sampai `r round(max(dx$Mean), 3)`) dengan median yang hampir sama dengan rata-ratanya, simpangan baku `r round(min(dx$SD), 2)` sampai `r round(max(dx$SD), 2)`, dan rentang nilai sekitar −5 sampai 5. Ini menunjukkan sebaran yang simetris dan skala antarprediktor yang relatif seragam. Meski begitu, prediktor tetap **distandarisasi** sebelum Ridge karena penalti $\lambda\sum\beta_j^2$ bergantung pada besar koefisien, sehingga bergantung pula pada satuan variabel.
+
+Respon $Y$ memiliki rata-rata `r round(dy$Mean, 2)`, median `r round(dy$Median, 2)`, dan simpangan baku `r round(dy$SD, 2)`, dengan rentang `r round(dy$Min, 2)` sampai `r round(dy$Max, 2)`. Rata-rata yang lebih besar dari median dan nilai maksimum yang berjarak `r round((dy$Max - dy$Mean) / dy$SD, 1)` simpangan baku di atas rata-rata (minimum hanya `r round((dy$Mean - dy$Min) / dy$SD, 1)`) menunjukkan sebaran $Y$ menjulur ke kanan dengan ekor panjang. Hal ini perlu diperhatikan pada uji normalitas dan heteroskedastisitas sisaan, serta pada pengaruh nilai ekstrem terhadap OLS.
+
+# Persiapan Data dan Pembagian Training-Testing
+
+Model: $Y = \beta_0 + \beta_1 X_1 + \cdots + \beta_{30} X_{30} + \varepsilon$.
+
+Data dibagi **80% training dan 20% testing secara berurutan (tidak diacak)** agar urutan observasi terjaga, karena uji autokorelasi dan GLS AR(1) mengandaikan urutan baris adalah urutan pengamatan.
+
+```{r train-test}
+X_all <- cbind(`(Intercept)` = 1, as.matrix(data_raw[, predictor_cols]))
+y_all <- data_raw[[target_col]]
+rm(data_raw); invisible(gc())
+
+n       <- nrow(X_all)
+p       <- length(predictor_cols) 
+n_train <- floor(0.80 * n)
+
+X_train <- X_all[1:n_train, , drop = FALSE];        y_train <- y_all[1:n_train]
+X_test  <- X_all[(n_train + 1):n, , drop = FALSE];  y_test  <- y_all[(n_train + 1):n]
+rm(X_all, y_all); invisible(gc())
+
+cat("Training :", n_train, "observasi\n")
+cat("Testing  :", n - n_train, "observasi\n")
+
+# Formula untuk uji diagnostik
+reg_formula <- reformulate(predictor_cols, response = "y_resp")
+```
+
+# Model OLS
+
+OLS meminimumkan RSS, $\hat\beta_{OLS} = (X^TX)^{-1}X^Ty$. Fungsi `lm.fit()` dipakai karena lebih ringan daripada `lm()` untuk data sangat besar.
+
+```{r ols-model}
+ols_fit <- lm.fit(X_train, y_train)
+stopifnot("Koefisien NA: ada kolinearitas sempurna" = !anyNA(ols_fit$coefficients))
+
+ols_coef       <- setNames(ols_fit$coefficients, colnames(X_train))
+ols_pred_train <- drop(X_train %*% ols_coef)
+ols_pred_test  <- drop(X_test  %*% ols_coef)
+ols_resid      <- y_train - ols_pred_train
+rm(ols_fit); invisible(gc())
+
+r2_ols <- 1 - sum(ols_resid^2) / sum((y_train - mean(y_train))^2)
+cat("RMSE training OLS:", round(sqrt(mean(ols_resid^2)), 6), "| R-kuadrat:", round(r2_ols, 4), "\n")
+knitr::kable(data.frame(Variabel = names(ols_coef), Estimasi = ols_coef, row.names = NULL),
+             digits = 6, caption = "Koefisien OLS")
+ols_b  <- ols_coef[-1]
+kuat   <- ols_b[abs(ols_b) >= 0.7]
+lemah  <- ols_b[abs(ols_b) < 0.7]
+kuat_n <- names(kuat)[order(-abs(kuat))]
+```
+
+Model OLS menghasilkan RMSE training `r round(sqrt(mean(ols_resid^2)), 3)` dan $R^2$ = `r round(r2_ols, 4)`, artinya prediktor hanya menjelaskan sekitar `r round(100 * r2_ols, 1)`% variasi $Y$, sedangkan `r round(100 * (1 - r2_ols), 1)`% sisanya tidak terjelaskan. RMSE ini hanya sedikit di bawah simpangan baku $Y$ (`r round(sd(y_train), 3)`). Intersep `r round(ols_coef[1], 3)` mendekati rata-rata $Y$ (`r round(mean(y_train), 3)`), sesuai dengan rata-rata prediktor yang mendekati nol.
+
+Koefisien terbagi dua kelompok. Sebanyak `r length(kuat)` prediktor berpengaruh besar ($|\hat\beta| \geq 0{,}7$), berturut-turut dari yang terbesar: `r paste(kuat_n, collapse = ", ")`. Misalnya, kenaikan satu satuan `r kuat_n[1]` dikaitkan dengan perubahan rata-rata $Y$ sebesar `r round(kuat[kuat_n[1]], 3)` satuan, dengan prediktor lain dianggap tetap (*ceteris paribus*). Sisanya, `r length(lemah)` prediktor, berkoefisien kecil (maksimum $|\hat\beta|$ = `r round(max(abs(lemah)), 3)`) sehingga sumbangannya terhadap $Y$ kecil. Karena prediktor berskala hampir sama (simpangan baku sekitar 0,7 sampai 1), besar koefisien dapat dibandingkan secara kasar antarprediktor.
+
+# Uji Asumsi Sisaan OLS
+
+OLS menghasilkan penduga terbaik (*BLUE*) bila asumsi Gauss-Markov terpenuhi: sisaan berdistribusi normal, ragam galat konstan ($\text{Var}(\varepsilon_i) = \sigma^2$), galat tidak saling berkorelasi ($\text{Cov}(\varepsilon_i, \varepsilon_j) = 0$), dan antarprediktor tidak berkorelasi kuat. Uji dilakukan pada sisaan OLS sebelum menentukan model alternatif.
+
+## Normalitas Sisaan
+
+$H_0$: sisaan berdistribusi normal; $H_1$: sisaan tidak berdistribusi normal.
+
+Shapiro-Wilk di R hanya valid untuk $3 \le n \le 5000$, sehingga dipakai pada **sampel acak 5.000 sisaan**. Sebagai pelengkap dipakai uji Jarque-Bera pada seluruh sisaan, $JB = \frac{n}{6}\left[S^2 + \frac{(K-3)^2}{4}\right] \sim \chi^2_2$.
+
+```{r normality}
+norm_sample    <- sample(ols_resid, 5000)
+shapiro_result <- shapiro.test(norm_sample)
+
+skew <- mean(ols_resid^3) / mean(ols_resid^2)^1.5
+kurt <- mean(ols_resid^4) / mean(ols_resid^2)^2
+jb   <- length(ols_resid) / 6 * (skew^2 + (kurt - 3)^2 / 4)
+p_jb <- pchisq(jb, df = 2, lower.tail = FALSE)
+
+norm_table <- data.frame(Uji = c("Shapiro-Wilk (sampel 5000)", "Jarque-Bera (seluruh data)"),
+                         Statistik = c(unname(shapiro_result$statistic), jb),
+                         p_value   = c(shapiro_result$p.value, p_jb))
+knitr::kable(norm_table, digits = 6, caption = "Uji normalitas sisaan OLS")
+cat("Skewness:", round(skew, 4), "| Kurtosis:", round(kurt, 4), "(normal: skewness 0, kurtosis 3)\n")
+```
+
+```{r qqplot, fig.width=10}
+par(mfrow = c(1, 2))
+hist(norm_sample, breaks = 50, freq = FALSE, col = "grey85", border = "white",
+     main = "Histogram Sisaan OLS", xlab = "Sisaan")
+curve(dnorm(x, 0, sd(ols_resid)), add = TRUE, col = "red", lwd = 2)
+qqnorm(norm_sample, main = "Normal Q-Q Plot Sisaan OLS", pch = 16, cex = 0.4)
+qqline(norm_sample, col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+Uji Shapiro-Wilk pada sampel acak 5.000 sisaan memberi $W$ = 0,9444 dengan p-value \< 2,2e-16, dan uji Jarque-Bera pada seluruh sisaan memberi $JB$ = 943.170,85 dengan p-value \< 2,2e-16. Kedua p-value lebih kecil dari $\alpha$ = 5%, sehingga $H_0$ **ditolak**: sisaan OLS tidak berdistribusi normal.
+
+Penyimpangannya nyata dan bukan sekadar akibat $n$ yang besar. Skewness = 1,143 (normal: 0) menunjukkan sebaran menjulur ke kanan, dan kurtosis = 6,693 (normal: 3) menunjukkan ekor yang jauh lebih berat daripada normal. Histogram memperlihatkan hal yang sama: ekor kanan memanjang sampai sekitar 40, sedangkan sisi kiri berhenti di sekitar −18. Pada Q-Q plot, titik-titik melengkung tajam menjauhi garis pada ekor kanan.
+
+Dampaknya: (1) untuk inferensi koefisien, dengan $n$ sekitar 1,2 juta Teorema Limit Pusat membuat uji-t dan selang kepercayaan tetap mendekati valid, asalkan heteroskedastisitas dan autokorelasi ditangani; (2) selang prediksi individu yang berbasis distribusi normal tidak dapat diandalkan karena ekornya berat; (3) nilai ekstrem pada ekor kanan dapat berpengaruh besar pada OLS. Hasil ini perlu dibaca bersama uji heteroskedastisitas dan autokorelasi berikutnya.
+
+## Multikolinearitas (VIF)
+
+$$VIF_j = \frac{1}{1 - R_j^2}$$
+
+dengan $R_j^2$ koefisien determinasi regresi $X_j$ terhadap prediktor lainnya. Aturan umum: VIF \> 5 perlu diperhatikan, VIF \> 10 menunjukkan multikolinearitas kuat. Perhitungan memakai sampel acak 50.000 baris training.
+
+```{r vif}
+# VIF dari seluruh data training
+cor_x      <- cor(X_train[, -1, drop = FALSE])
+vif_values <- setNames(diag(solve(cor_x)), predictor_cols)
+kappa_x    <- kappa(cor_x, exact = TRUE)
+
+vif_table <- data.frame(Variabel = names(vif_values), VIF = as.numeric(vif_values), row.names = NULL)
+vif_table$Status <- ifelse(vif_table$VIF >= 10, "Multikolinearitas kuat",
+                    ifelse(vif_table$VIF >= 5,  "Perlu diperhatikan", "Relatif rendah"))
+knitr::kable(vif_table, digits = 4, caption = "Variance Inflation Factor per prediktor")
+cat("VIF > 10:", sum(vif_table$VIF > 10), "| VIF 5-10:", sum(vif_table$VIF >= 5 & vif_table$VIF <= 10),
+    "| VIF maks:", round(max(vif_table$VIF), 3), "| Condition number:", round(kappa_x, 1), "\n")
+```
+
+```{r vif-plot, fig.width=10, fig.height=4}
+barplot(vif_table$VIF, names.arg = vif_table$Variabel, las = 2, cex.names = 0.7,
+        col = ifelse(vif_table$VIF >= 10, "tomato", "steelblue"),
+        main = "VIF per Prediktor", ylab = "VIF")
+abline(h = c(5, 10), lty = 2, col = c("orange", "red"))
+```
+
+```{r vif-max, include=FALSE}
+max_vif <- max(vif_table$VIF)   # dipakai lagi di bagian kesimpulan
+```
+
+Dari 30 prediktor, **27 prediktor memiliki VIF \> 10** (multikolinearitas kuat) dan 3 prediktor berada pada rentang 5 sampai 10 (X10 = 7,60; X15 = 9,12; X30 = 5,00). Tidak ada satu pun prediktor dengan VIF \< 5. VIF terbesar dimiliki X28 (334,17), diikuti X29 (329,22), X27 (298,66), X26 (289,92), dan X11 (202,25). Nilai 334,17 berarti $R_j^2 = 1 - 1/334{,}17 \approx 0{,}997$, yaitu X28 hampir seluruhnya (99,7%) dapat dijelaskan oleh prediktor lainnya. Condition number matriks korelasi sebesar 3.337,3 (akar kuadratnya, yaitu *condition index*, sekitar 57,8 dan melewati batas lazim 30 untuk kolinearitas serius) menguatkan temuan ini.
+
+Dampaknya, galat baku koefisien OLS membengkak sebesar $\sqrt{VIF}$ kali; untuk X28 sekitar 18 kali lipat dibanding bila prediktor saling bebas. Akibatnya koefisien individual tidak stabil dan sulit ditafsirkan, dan uji-t menjadi kurang bertenaga. Di sisi lain, kemampuan prediksi keseluruhan OLS umumnya tidak banyak terganggu oleh multikolinearitas. Temuan ini menjadi alasan kuat menggunakan **Ridge Regression**, yang menstabilkan estimasi lewat penalti $\lambda I$ pada $X^TX$.
+
+## Heteroskedastisitas
+
+Uji **Breusch-Pagan** (versi Koenker): $H_0$: ragam galat konstan (homoskedastik); $H_1$: ragam galat tidak konstan. Statistik $LM = nR^2$ dari regresi $e_i^2$ terhadap seluruh $X$, berdistribusi $\chi^2_{30}$ di bawah $H_0$. Model diuji pada seluruh arbis training.
+
+```{r bp-test}
+# Uji Breusch-Pagan menggunakan seluruh data training
+bp_data <- data.frame(
+  y_resp = y_train,
+  X_train[, -1, drop = FALSE]
+)
+names(bp_data) <- c("y_resp", predictor_cols)
+bp_result <- lmtest::bptest(
+  lm(reg_formula, data = bp_data)
+)
+rm(bp_data)
+bp_result
+
+# Variabel X yang paling berkaitan dengan besar sisaan
+cor_abs <- abs(
+  drop(cor(
+    abs(ols_resid),
+    X_train[, -1, drop = FALSE]
+  ))
+)
+names(cor_abs) <- predictor_cols
+var_het <- names(which.max(cor_abs))
+cat("\nKorelasi |sisaan| dengan X (5 terbesar):\n")
+print(round(head(sort(cor_abs, decreasing = TRUE), 5), 4))
+```
+
+```{r residual-plot, fig.width=10}
+pl_id <- sample(n_train, 5000)
+par(mfrow = c(1, 2))
+plot(ols_pred_train[pl_id], ols_resid[pl_id], pch = 16, cex = 0.4, col = rgb(0, 0, 0, 0.3),
+     xlab = "Nilai prediksi", ylab = "Sisaan", main = "Sisaan vs Prediksi (OLS)")
+abline(h = 0, col = "red", lty = 2)
+lines(lowess(ols_pred_train[pl_id], ols_resid[pl_id]), col = "blue", lwd = 2)
+plot(X_train[pl_id, var_het], ols_resid[pl_id], pch = 16, cex = 0.4, col = rgb(0, 0, 0, 0.3),
+     xlab = var_het, ylab = "Sisaan", main = paste("Sisaan vs", var_het))
+abline(h = 0, col = "red", lty = 2)
+par(mfrow = c(1, 1))
+```
+
+Uji Breusch-Pagan memberi $LM$ = `r round(unname(bp_result$statistic), 2)` (df = `r unname(bp_result$parameter)`) dengan p-value = `r format.pval(bp_result$p.value, digits = 4)`. Karena p-value lebih besar dari $\alpha$ = 5%, $H_0$ **gagal ditolak**: tidak terdapat cukup bukti adanya heteroskedastisitas, sehingga ragam galat diasumsikan konstan (**homoskedastik**).
+
+Hubungan antara nilai mutlak sisaan ($|e_i|$) dengan seluruh prediktor sangat lemah. Prediktor yang paling berkaitan dengan besar sisaan adalah `r var_het` dengan korelasi hanya `r round(cor_abs[var_het], 4)`, diikuti `r names(sort(cor_abs, decreasing = TRUE))[2]` (`r round(sort(cor_abs, decreasing = TRUE)[2], 4)`) dan `r names(sort(cor_abs, decreasing = TRUE))[3]` (`r round(sort(cor_abs, decreasing = TRUE)[3], 4)`).
+
+Hasil ini diperkuat oleh plot diagnostik:
+
+1. **Plot Sisaan vs Nilai Prediksi**: titik-titik sisaan tersebar acak di sekitar garis nol ($e = 0$) tanpa membentuk pola corong (*funneling*), dengan garis *lowess* (biru) membentang mendatar.
+2. **Plot Sisaan vs `r var_het`**: sebaran sisaan terhadap `r var_het` simetris tanpa pengelompokan ragam.
+
+Karena asumsi homoskedastisitas terpenuhi, penduga OLS tetap *Best Linear Unbiased Estimator* (BLUE) dan galat bakunya valid pada aspek ragam. Model WLS tetap dibangun sesuai perintah tugas, tetapi karena ragam galat homogen, bobot yang dihasilkan diperkirakan hampir seragam sehingga estimasi WLS sangat mendekati OLS.
+
+## Autokorelasi Sisaan
+
+$H_0$: $\rho = 0$ (tidak ada autokorelasi); $H_1$: $\rho \neq 0$. Dipakai tiga uji: Durbin-Watson (lag 1), Breusch-Godfrey (lag 1), dan Ljung-Box (lag 10). DW dan BG diterapkan pada **100.000 baris pertama** training agar urutan observasi terjaga; Ljung-Box memakai seluruh sisaan. Statistik DW mendekati 2 bila tidak ada autokorelasi, dengan $DW \approx 2(1-\hat\rho)$.
+
+```{r dw-test}
+dw_n    <- min(100000, n_train)
+dw_data <- data.frame(y_resp = y_train[1:dw_n], X_train[1:dw_n, -1, drop = FALSE])
+names(dw_data) <- c("y_resp", predictor_cols)
+dw_fit  <- lm(reg_formula, data = dw_data)
+
+dw_result <- lmtest::dwtest(dw_fit, alternative = "two.sided")
+bg_result <- lmtest::bgtest(dw_fit, order = 1)
+lb_result <- Box.test(ols_resid, lag = 10, type = "Ljung-Box")
+rm(dw_data, dw_fit)
+
+rho_hat <- function(e) sum(e[-1] * e[-length(e)]) / sum(e[-length(e)]^2)
+rho_ols <- rho_hat(ols_resid)
+
+auto_table <- data.frame(Uji = c("Durbin-Watson (lag 1)", "Breusch-Godfrey (lag 1)", "Ljung-Box (lag 10)"),
+                         Statistik = c(unname(dw_result$statistic), unname(bg_result$statistic),
+                                       unname(lb_result$statistic)),
+                         p_value = c(dw_result$p.value, bg_result$p.value, lb_result$p.value))
+knitr::kable(auto_table, digits = 6, caption = "Uji autokorelasi sisaan OLS")
+cat("Estimasi autokorelasi lag-1 (rho-hat):", round(rho_ols, 4), "\n")
+```
+
+```{r acf-plot, fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+acf(ols_resid,  lag.max = 30, main = "ACF Sisaan OLS")
+pacf(ols_resid, lag.max = 30, main = "PACF Sisaan OLS")
+par(mfrow = c(1, 1))
+```
+
+Hasil ketiga uji formal:
+
+1. **Durbin-Watson (lag 1):** $DW$ = `r round(unname(dw_result$statistic), 4)` dengan p-value `r format.pval(dw_result$p.value, digits = 4, eps = 0.0001)`. Nilai ini sesuai dengan hubungan $DW \approx 2(1-\hat\rho)$, yaitu `r round(2 * (1 - rho_ols), 4)`.
+2. **Breusch-Godfrey (lag 1):** $\chi^2$ = `r round(unname(bg_result$statistic), 2)` dengan p-value `r format.pval(bg_result$p.value, digits = 4, eps = 0.0001)`.
+3. **Ljung-Box (lag 10):** $Q$ = `r round(unname(lb_result$statistic), 2)` dengan p-value `r format.pval(lb_result$p.value, digits = 4, eps = 0.0001)`.
+
+Sebanyak `r sum(c(dw_result$p.value, bg_result$p.value, lb_result$p.value) < 0.05)` dari 3 uji signifikan pada $\alpha$ = 0,05, sehingga $H_0$ **ditolak**: terdapat **autokorelasi positif** yang signifikan pada sisaan OLS, dengan estimasi $\hat\rho$ = `r round(rho_ols, 4)`.
+
+Struktur autokorelasinya diperkuat oleh grafik diagnostik:
+
+- **Plot ACF:** meluruh secara bertahap (*exponential decay*) seiring bertambahnya lag.
+- **Plot PACF:** terpotong tajam (*cut-off*) tepat setelah lag 1.
+
+Pola ACF dan PACF ini sesuai dengan galat **Autoregressive orde satu, AR(1)**.
+
+Autokorelasi menyebabkan galat baku OLS *underestimated*. Meskipun koefisien OLS tetap tak bias, uji-$t$ dan selang kepercayaannya tidak dapat diandalkan. Karena itu model **GLS** dengan transformasi Prais-Winsten relevan untuk mengoreksi struktur AR(1) ini.
+
+
+# Model WLS
+
+WLS menangani heteroskedastisitas dengan pembobotan, $W = \text{diag}(w_1,\ldots,w_n)$, $w_i = 1/\sigma_i^2$. Karena $\sigma_i^2$ tidak diketahui, ragam diduga dari sisaan OLS (*Feasible WLS*, regresi bantu Harvey):
+
+$$\log(e_i^2) = X_i\gamma + u_i \implies \hat\sigma_i^2 = \exp(X_i\hat\gamma), \qquad w_i = \frac{1}{\hat\sigma_i^2}$$
+
+Pendekatan ini memakai seluruh $X$ sekaligus, sehingga tidak perlu menebak satu variabel penyebab dari plot sisaan (pada materi, pola corong pada satu $X$ dipetakan ke bobot $1/X$ atau $1/X^2$). Skala bobot tidak memengaruhi penduga, sehingga bobot dinormalkan dengan rata-rata geometriknya.
+
+```{r wls-model}
+aux_fit    <- lm.fit(X_train, log(ols_resid^2 + 1e-12))
+wls_weight <- exp(-drop(X_train %*% aux_fit$coefficients))
+wls_weight <- wls_weight / exp(mean(log(wls_weight)))
+rm(aux_fit)
+
+sw      <- sqrt(wls_weight)
+wls_fit <- lm.fit(X_train * sw, y_train * sw)
+stopifnot("Koefisien WLS NA" = !anyNA(wls_fit$coefficients))
+
+wls_coef       <- setNames(wls_fit$coefficients, colnames(X_train))
+wls_pred_train <- drop(X_train %*% wls_coef)
+wls_pred_test  <- drop(X_test  %*% wls_coef)
+wls_resid      <- y_train - wls_pred_train
+rm(wls_fit); invisible(gc())
+
+cat("Ringkasan bobot WLS:\n"); print(summary(wls_weight))
+cat("RMSE training WLS:", round(sqrt(mean(wls_resid^2)), 6), "\n")
+knitr::kable(data.frame(Variabel = names(wls_coef), Estimasi = wls_coef, row.names = NULL),
+             digits = 6, caption = "Koefisien WLS")
+```
+
+Ringkasan distribusi bobot WLS menunjukkan bahwa nilai bobot berkisar dari `r round(min(wls_weight), 4)` hingga `r round(max(wls_weight), 4)` dengan rata-rata mendekati 1 (`r round(mean(wls_weight), 4)`). Rasio antara bobot terbesar dan terkecil hanya sebesar `r format(round(max(wls_weight) / min(wls_weight), 2), big.mark = ".", decimal.mark = ",")`.
+
+Karena rasio bobot sangat kecil (jauh di bawah 2), bobot yang dihasilkan tergolong **hampir seragam** (*homogen*) di seluruh observasi. Temuan ini sangat konsisten dengan hasil uji Breusch-Pagan sebelumnya yang mengonfirmasi bahwa ragam galat bersifat homoskedastik.
+
+Akibat dari bobot yang seragam ini, estimasi koefisien WLS (seperti intersep sebesar `r round(wls_coef[1], 4)` dan koefisien X1 sebesar `r round(wls_coef["X1"], 4)`) serta nilai **RMSE training WLS (`r round(sqrt(mean(wls_resid^2)), 4)`)** praktis identik dengan hasil pada model OLS. 
+
+Perlu dicatat bahwa manfaat utama WLS adalah untuk meningkatkan efisiensi estimasi dan validitas inferensi (galat baku dan uji-\(t\)) saat terjadi heteroskedastisitas, bukan secara otomatis menurunkan RMSE prediksi titik, karena persamaan prediksinya tetap \(X\hat{\beta}\).
+
+
+# Model GLS
+
+GLS memakai matriks kovarians galat $\Omega$:
+
+$$\hat\beta_{GLS} = (X^T\Omega^{-1}X)^{-1}X^T\Omega^{-1}y$$
+
+Galat diasumsikan $\varepsilon_t = \sqrt{\lambda_t}\,\eta_t$ dengan $\eta_t = \rho\,\eta_{t-1} + \nu_t$ (AR(1), $\text{Corr}(\varepsilon_i,\varepsilon_j) = \rho^{|i-j|}$) dan $\lambda_t = 1/w_t$ dari tahap WLS, sehingga $\Omega$ mencakup heteroskedastisitas dan autokorelasi sekaligus. Matriks $\Omega$ berukuran $n \times n$ tidak mungkin dibentuk untuk jutaan observasi, sehingga penduga yang sama dihitung lewat **transformasi Prais-Winsten** pada data terbobot:
+
+$$\tilde y_1 = \sqrt{1-\rho^2}\,y_1^{*},\quad \tilde y_t = y_t^{*} - \rho\, y_{t-1}^{*}\ (t \ge 2), \qquad y_t^{*} = \sqrt{w_t}\,y_t$$
+
+dan hal yang sama untuk setiap kolom $X$, lalu OLS pada data tertransformasi. Nilai $\rho$ diduga berulang (FGLS) sampai konvergen.
+
+```{r gls-model}
+pw_transform <- function(M, rho) {        # transformasi Prais-Winsten
+  M <- as.matrix(M); m <- nrow(M); out <- M
+  out[-1, ] <- M[-1, , drop = FALSE] - rho * M[-m, , drop = FALSE]
+  out[1, ]  <- sqrt(1 - rho^2) * M[1, ]
+  out
+}
+
+Xw  <- X_train * sw
+yw  <- y_train * sw
+rho <- rho_hat(sw * wls_resid)            # nilai awal dari sisaan WLS terbobot
+
+for (iter in 1:10) {
+  gls_fit <- lm.fit(pw_transform(Xw, rho), drop(pw_transform(yw, rho)))
+  stopifnot("Koefisien GLS NA" = !anyNA(gls_fit$coefficients))
+  rho_new <- rho_hat(sw * (y_train - drop(X_train %*% gls_fit$coefficients)))
+  if (abs(rho_new - rho) < 1e-6 || iter == 10) break
+  rho <- rho_new
+}
+rm(Xw, yw); invisible(gc())
+
+gls_coef       <- setNames(gls_fit$coefficients, colnames(X_train))
+gls_rss        <- sum(gls_fit$residuals^2)          # RSS pada data tertransformasi
+gls_pred_train <- drop(X_train %*% gls_coef)
+gls_pred_test  <- drop(X_test  %*% gls_coef)
+gls_resid      <- y_train - gls_pred_train
+gls_df <- n_train - ncol(X_train)
+gls_se <- sqrt(diag(chol2inv(qr.R(gls_fit$qr))) * sum(gls_fit$residuals^2) / gls_df)
+rm(gls_fit); invisible(gc())
+
+cat("Iterasi:", iter, "| rho GLS =", round(rho, 5), "\n")
+cat("RMSE training GLS:", round(sqrt(mean(gls_resid^2)), 6), "\n")
+knitr::kable(data.frame(Variabel = names(gls_coef), Estimasi = gls_coef, row.names = NULL),
+             digits = 6, caption = "Koefisien GLS")
+```
+
+Proses FGLS konvergen hanya dalam **2 iterasi** dengan $\hat\rho$ = 0,69997 ($\approx 0{,}70$). Nilai ini menunjukkan autokorelasi positif yang kuat pada galat: galat suatu observasi membawa sekitar 70% dari galat observasi sebelumnya ($\text{Corr}(\varepsilon_i,\varepsilon_j)=\rho^{|i-j|}$). Nilai yang sangat bulat ini, dengan konvergensi secepat itu, menandakan struktur AR(1) cocok untuk data ini (kemungkinan memang parameter yang dipakai saat simulasi). Transformasi Prais-Winsten menghilangkan korelasi serial ini sebelum koefisien diduga, sehingga galat baku dan uji-t GLS lebih valid daripada OLS. Keberhasilannya dibuktikan pada pemeriksaan ulang sisaan di bawah.
+
+Koefisien GLS sangat dekat dengan OLS pada prediktor yang berpengaruh besar, misalnya X1 (2,964 vs 3,011), X4 (−2,482 vs −2,507), X11 (2,154 vs 2,202), dan X23 (1,005 vs 1,048), dengan tanda yang sama. Ini wajar karena OLS dan GLS sama-sama tak bias; autokorelasi hanya mengurangi efisiensi OLS, tidak menggeser rata-rata penduganya. Perbedaan paling terlihat ada pada prediktor berkoefisien kecil: X27 turun dari 0,225 menjadi 0,070, X28 dari −0,176 menjadi −0,045, X29 dari 0,153 menjadi 0,041, dan X2 bahkan berganti tanda (−0,019 menjadi 0,032). 
+
+Perbedaan paling terlihat ada pada prediktor berkoefisien kecil: X27 turun dari 0,225 menjadi 0,070, X28 dari −0,176 menjadi −0,045, X29 dari 0,153 menjadi 0,041, dan X2 bahkan berganti tanda (−0,019 menjadi 0,032). Prediktor ini sebagian besar ber-VIF tinggi, sehingga perbedaannya kemungkinan mencerminkan ketidakstabilan estimasi akibat multikolinearitas; tanpa galat baku, besarnya perbedaan belum dapat dinilai signifikan. Prediksi GLS tetap $X\hat\beta_{GLS}$ pada skala variabel asli dan tidak memanfaatkan korelasi serial galat.
+
+
+## Pemeriksaan Ulang Sisaan Setelah WLS dan GLS
+
+Sisaan yang relevan untuk diuji adalah sisaan yang sudah dibobot (WLS) atau dibobot dan didekorelasi (GLS).
+
+```{r post-diagnostics}
+bp_koenker <- function(e, X) {            # LM = n * R^2 dari regresi e^2 pada X
+  e2 <- e^2
+  r2 <- 1 - sum(lm.fit(X, e2)$residuals^2) / sum((e2 - mean(e2))^2)
+  pchisq(length(e) * r2, df = ncol(X) - 1, lower.tail = FALSE)
+}
+dw_stat <- function(e) sum(diff(e)^2) / sum(e^2)
+
+u_wls <- sw * wls_resid
+u_gls <- sw * gls_resid
+v_gls <- c(sqrt(1 - rho^2) * u_gls[1], u_gls[-1] - rho * u_gls[-n_train])
+
+post_table <- data.frame(
+  Sisaan        = c("OLS (asli)", "WLS (terbobot)", "GLS (terbobot + dekorelasi)"),
+  p_value_BP    = c(bp_koenker(ols_resid, X_train), bp_koenker(u_wls, X_train), bp_koenker(v_gls, X_train)),
+  DW            = c(dw_stat(ols_resid), dw_stat(u_wls), dw_stat(v_gls)),
+  rho_hat       = c(rho_hat(ols_resid), rho_hat(u_wls), rho_hat(v_gls)))
+knitr::kable(post_table, digits = 5, caption = "Diagnostik sisaan sebelum dan sesudah perbaikan (seluruh data training)")
+```
+
+**Autokorelasi.** Pada sisaan OLS, $\hat\rho$ = 0,69998 dan DW = 0,600, sesuai hubungan $DW \approx 2(1-\hat\rho) = 0{,}6$, yang berarti autokorelasi positif yang kuat. WLS tidak mengubahnya (DW = 0,600; $\hat\rho$ = 0,69995) karena pembobotan hanya menangani ragam galat, bukan korelasi antargalat. Setelah GLS, $\hat\rho$ turun menjadi $-0{,}0003$ dan DW menjadi 2,0006, hampir persis nilai ideal 2. Jadi transformasi Prais-Winsten menghilangkan autokorelasi sepenuhnya, dan ini membuktikan AR(1) memang struktur galat yang tepat untuk data ini.
+
+**Heteroskedastisitas.** Uji Breusch-Pagan pada seluruh data training memberi p-value 0,405 (OLS), 0,352 (WLS), dan 0,166 (GLS). Ketiganya di atas $\alpha$ = 5%, sehingga $H_0$ (ragam galat konstan) **tidak ditolak** pada semua model: tidak ada bukti heteroskedastisitas, bahkan sebelum diperbaiki. Dengan $n$ sekitar 1,2 juta uji ini sangat peka, jadi p-value sebesar itu merupakan bukti yang cukup kuat bahwa ragamnya konstan. Perubahan p-value antarmodel (0,405 menjadi 0,166) tidak bermakna, karena semuanya sama-sama tidak signifikan; p-value yang lebih besar tidak berarti lebih baik.
+
+Masalah utama pada data ini adalah **autokorelasi**, bukan heteroskedastisitas. Karena itu WLS hampir tidak memberi perbaikan dibanding OLS (DW dan $\hat\rho$ praktis identik), sedangkan GLS yang menangani autokorelasi memberi perbaikan nyata. Pada perbandingan model, keunggulan GLS diharapkan terlihat pada AIC, sedangkan WLS akan hampir sama dengan OLS. WLS tetap dibangun sesuai perintah tugas.
+
+
+# Ridge Regression
+
+Ridge menambahkan penalti L2 pada RSS:
+
+$$\hat\beta_{Ridge} = \arg\min_\beta\left[\sum_i (y_i - \hat y_i)^2 + \lambda\sum_{j=1}^{p}\beta_j^2\right] = (X^TX + \lambda I)^{-1}X^Ty$$
+
+Pada Ridge Regresssion, prediktor **distandarisasi** ($\bar z = 0$, $s_z = 1$), intersep **tidak dipenalti**, dan $\lambda$ dipilih dengan **validasi silang** $K$-fold ($K = 10$) berdasarkan rata-rata MSE prediksi terkecil. Karena $p = 30$ kecil, penduga tertutup dihitung langsung dari $Z^TZ$ ($30 \times 30$), sehingga validasi silang dapat dilakukan tepat tanpa mengulang regresi pada jutaan baris.
+
+```{r ridge-data}
+mu_x <- colMeans(X_train[, -1, drop = FALSE])
+sd_x <- apply(X_train[, -1, drop = FALSE], 2, sd)
+Z    <- scale(X_train[, -1, drop = FALSE], center = mu_x, scale = sd_x)   # prediktor terstandarisasi
+y_mu <- mean(y_train)
+yc   <- y_train - y_mu                                                     # respon dipusatkan (intersep tak dipenalti)
+```
+
+```{r ridge-cv}
+K      <- 10
+folds  <- sample(rep(1:K, length.out = n_train))
+XtX_k  <- lapply(1:K, function(k) crossprod(Z[folds == k, , drop = FALSE]))
+Xty_k  <- lapply(1:K, function(k) crossprod(Z[folds == k, , drop = FALSE], yc[folds == k]))
+yty_k  <- sapply(1:K, function(k) sum(yc[folds == k]^2))
+n_k    <- tabulate(folds, K)
+XtX    <- Reduce(`+`, XtX_k)
+Xty    <- Reduce(`+`, Xty_k)
+
+ridge_beta  <- function(A, b, lambda) drop(solve(A + lambda * diag(ncol(A)), b))
+lambda_grid <- 10^seq(-2, 8, length.out = 100)
+
+cv_mse <- sapply(lambda_grid, function(lam) {
+  mse_k <- sapply(1:K, function(k) {
+    b <- ridge_beta(XtX - XtX_k[[k]], Xty - Xty_k[[k]], lam)      # dilatih pada K-1 lipatan
+    (yty_k[k] - 2 * sum(b * Xty_k[[k]]) + drop(t(b) %*% XtX_k[[k]] %*% b)) / n_k[k]   # MSE pada lipatan uji
+  })
+  weighted.mean(mse_k, n_k)
+})
+
+lambda_min <- lambda_grid[which.min(cv_mse)]
+cat("Lambda optimal (MSE CV terkecil):", signif(lambda_min, 4),
+    "| log10 =", round(log10(lambda_min), 3), "\n")
+if (lambda_min %in% range(lambda_grid)) warning("Lambda optimal berada di tepi grid; perluas lambda_grid.")
+```
+
+```{r ridge-plot, fig.width=10}
+par(mfrow = c(1, 2))
+plot(log10(lambda_grid), cv_mse, type = "l", lwd = 2, xlab = expression(log[10](lambda)),
+     ylab = "MSE validasi silang", main = "Validasi Silang 10-fold Ridge")
+abline(v = log10(lambda_min), lty = 2, col = "red")
+jalur <- sapply(lambda_grid, function(l) ridge_beta(XtX, Xty, l))
+matplot(log10(lambda_grid), t(jalur), type = "l", lty = 1, xlab = expression(log[10](lambda)),
+        ylab = "Koefisien (terstandarisasi)", main = "Lintasan Koefisien Ridge")
+abline(v = log10(lambda_min), lty = 2, col = "red")
+par(mfrow = c(1, 1))
+```
+
+```{r ridge-model}
+# Koefisien akhir, dikembalikan ke skala asli
+b_std      <- ridge_beta(XtX, Xty, lambda_min)
+b_orig     <- b_std / sd_x
+ridge_coef <- c(`(Intercept)` = y_mu - sum(b_orig * mu_x), b_orig)
+names(ridge_coef) <- colnames(X_train)
+
+ridge_pred_train <- drop(X_train %*% ridge_coef)
+ridge_pred_test  <- drop(X_test  %*% ridge_coef)
+ridge_resid      <- y_train - ridge_pred_train
+
+# Derajat bebas efektif: df(lambda) = sum d_j^2 / (d_j^2 + lambda)
+ev       <- eigen(XtX, symmetric = TRUE, only.values = TRUE)$values
+ridge_df <- sum(ev / (ev + lambda_min))
+
+cat("Derajat bebas efektif Ridge:", round(ridge_df, 4), "dari", p, "prediktor\n")
+cat("RMSE training Ridge:", round(sqrt(mean(ridge_resid^2)), 6), "\n")
+rm(Z, XtX_k, Xty_k); invisible(gc())
+
+knitr::kable(data.frame(Variabel = names(ridge_coef), Estimasi_Skala_Asli = ridge_coef,
+                        Estimasi_Terstandarisasi = c(NA, b_std), row.names = NULL),
+             digits = 6, caption = "Koefisien Ridge Regression")
+```
+
+```{r ridge-compare}
+ols_b   <- ols_coef[-1]                    # koefisien tanpa intersep
+rdg_b   <- ridge_coef[-1]
+selisih <- rdg_b - ols_b
+top5    <- names(sort(abs(selisih), decreasing = TRUE))[1:5]
+
+knitr::kable(data.frame(Variabel = top5, OLS = ols_b[top5], Ridge = rdg_b[top5],
+                        Selisih = selisih[top5], Persen = 100 * selisih[top5] / ols_b[top5],
+                        row.names = NULL),
+             digits = 4, caption = "Lima koefisien dengan perubahan terbesar: OLS vs Ridge")
+
+rmse_ols_tr <- sqrt(mean(ols_resid^2))
+rmse_rdg_tr <- sqrt(mean(ridge_resid^2))
+cv_min      <- min(cv_mse)
+cv_max      <- max(cv_mse)
+lam_flat    <- max(lambda_grid[cv_mse <= cv_min * 1.001])   # lambda terbesar dengan MSE CV dalam 0,1% dari minimum
+```
+
+
+Validasi silang 10-fold memilih $\lambda$ optimal = `r signif(lambda_min, 4)` ($\log_{10}\lambda$ = `r round(log10(lambda_min), 2)`). Kurva MSE validasi silang **datar** di sisi kiri: MSE terkecil `r round(cv_min, 3)` (setara RMSE `r round(sqrt(cv_min), 3)`), dan nilai itu nyaris tidak berubah sampai $\lambda$ sekitar `r format(signif(lam_flat, 3), big.mark = ".", decimal.mark = ",")`. Baru setelah itu MSE naik tajam hingga `r round(cv_max, 2)` pada $\lambda = 10^8$, ketika semua koefisien ditarik ke nol dan model berubah menjadi *underfitting* (hanya intersep). Artinya, hasil Ridge tidak sensitif terhadap pilihan $\lambda$ di rentang yang datar itu, dan titik minimum `r signif(lambda_min, 4)` hanya satu pilihan di dalamnya. $\lambda$ optimal tidak berada di tepi grid, sehingga rentang pencarian sudah memadai.
+
+Derajat bebas efektif Ridge adalah `r round(ridge_df, 2)` dari `r p` prediktor, yaitu hanya berkurang `r round(p - ridge_df, 3)` derajat bebas dibanding OLS. Penalti sekecil ini terjadi karena $n$ sangat besar sehingga nilai eigen $X^TX$ (terkecil: `r format(round(min(ev)), big.mark = ".", decimal.mark = ",")`) jauh melampaui $\lambda$ = `r signif(lambda_min, 4)`, sehingga $\lambda I$ nyaris tidak mengubah $(X^TX + \lambda I)$. Akibatnya koefisien Ridge **hampir identik dengan OLS**: perubahan terbesar hanya pada `r top5[1]` (`r round(ols_b[top5[1]], 4)` menjadi `r round(rdg_b[top5[1]], 4)`, selisih `r round(selisih[top5[1]], 4)`), dan seluruh koefisien berubah tidak lebih dari `r round(max(abs(selisih)), 4)` (tabel di atas). Koefisien yang paling berubah adalah koefisien prediktor yang kolinear kuat, sesuai prinsip Ridge yang paling menyusutkan arah dengan nilai eigen kecil. Lintasan koefisien memperlihatkan koefisien stabil sampai $\lambda$ sekitar $10^3$, lalu menyusut mendekati nol pada $\lambda$ yang sangat besar, dan beberapa koefisien sempat naik atau berganti tanda sebelum menuju nol, pola yang lazim pada prediktor berkorelasi tinggi.
+
+RMSE training Ridge `r round(rmse_rdg_tr, 6)` dibanding OLS `r round(rmse_ols_tr, 6)` (selisih `r format(rmse_rdg_tr - rmse_ols_tr, digits = 2)`), jadi **tidak ada perbedaan praktis**. Ini wajar: Ridge menukar sedikit bias dengan varians yang lebih rendah, dan dengan $n$ sebesar ini varians koefisien OLS sudah kecil, sehingga ruang perbaikannya sempit meski VIF tinggi. Berbeda dengan Lasso, tidak ada koefisien yang tepat nol (|$\hat\beta$| terkecil = `r round(min(abs(rdg_b)), 4)`), jadi seluruh prediktor tetap berada di model. Perbandingan akurasi pada data testing dan AIC dibahas pada bagian perbandingan model.
+
+
+# Evaluasi dan Perbandingan Model
+
+**RMSE** dihitung pada data testing: $RMSE = \sqrt{\frac{1}{m}\sum (y_i - \hat y_i)^2}$.
+
+**AIC** dihitung pada data training dari log-likelihood Gaussian pada skala $Y$ asli:
+
+$$AIC = -2\log L + 2k, \qquad -2\log L = n\left[\log(2\pi) + \log\frac{RSS}{n} + 1\right] - 2\log|J|$$
+
+dengan $\log|J|$ suku Jacobian transformasi, yaitu $\tfrac12\sum\log w_i$ untuk WLS dan $\tfrac12\sum\log w_i + \tfrac12\log(1-\rho^2)$ untuk GLS, sehingga AIC keempat model sebanding. Jumlah parameter $k$: OLS dan WLS $= p+2$ (koefisien, intersep, $\sigma^2$); GLS $= p+3$ (ditambah $\rho$); Ridge $= \text{df}_{efektif}+2$.
+
+```{r evaluation}
+rmse      <- function(a, b) sqrt(mean((a - b)^2))
+aic_gauss <- function(rss, n, k, log_jac = 0) {
+  n * (log(2 * pi) + log(rss / n) + 1) - 2 * log_jac + 2 * k
+}
+
+aic_ols   <- aic_gauss(sum(ols_resid^2), n_train, k = p + 2)
+aic_wls   <- aic_gauss(sum(wls_weight * wls_resid^2), n_train, k = p + 2,
+                       log_jac = 0.5 * sum(log(wls_weight)))
+aic_gls   <- aic_gauss(gls_rss, n_train, k = p + 3,
+                       log_jac = 0.5 * sum(log(wls_weight)) + 0.5 * log(1 - rho^2))
+aic_ridge <- aic_gauss(sum(ridge_resid^2), n_train, k = ridge_df + 2)
+
+model_comparison <- data.frame(
+  Model      = c("OLS", "WLS", "GLS", "Ridge"),
+  RMSE_Test  = c(rmse(y_test, ols_pred_test), rmse(y_test, wls_pred_test),
+                 rmse(y_test, gls_pred_test), rmse(y_test, ridge_pred_test)),
+  AIC        = c(aic_ols, aic_wls, aic_gls, aic_ridge))
+model_comparison$Delta_AIC <- model_comparison$AIC - min(model_comparison$AIC)
+model_comparison$Rank_RMSE <- rank(model_comparison$RMSE_Test)
+model_comparison$Rank_AIC  <- rank(model_comparison$AIC)
+
+knitr::kable(model_comparison, digits = 6,
+             caption = "Perbandingan OLS, WLS, GLS, dan Ridge (RMSE testing dan AIC training)")
+```
+
+```{r compare-plot, fig.width=10}
+par(mfrow = c(1, 2))
+b1 <- barplot(model_comparison$RMSE_Test, names.arg = model_comparison$Model, col = "steelblue",
+              main = "RMSE Testing (kecil = lebih baik)", ylab = "RMSE",
+              ylim = c(0, max(model_comparison$RMSE_Test) * 1.15))
+text(b1, model_comparison$RMSE_Test, round(model_comparison$RMSE_Test, 4), pos = 3, cex = 0.8)
+b2 <- barplot(model_comparison$Delta_AIC, names.arg = model_comparison$Model, col = "tomato",
+              main = "Selisih AIC (0 = terbaik)", ylab = "Delta AIC",
+              ylim = c(0, max(model_comparison$Delta_AIC) * 1.15 + 1))
+text(b2, model_comparison$Delta_AIC, round(model_comparison$Delta_AIC, 1), pos = 3, cex = 0.8)
+par(mfrow = c(1, 1))
+```
+
+```{r coef-comparison}
+coef_tab <- data.frame(OLS = ols_coef, WLS = wls_coef, GLS = gls_coef, Ridge = ridge_coef)
+knitr::kable(coef_tab, digits = 5, caption = "Perbandingan koefisien keempat model")
+```
+
+
+# Interpretasi dan Kesimpulan
+
+```{r final-values}
+rmse_best  <- model_comparison$Model[which.min(model_comparison$RMSE_Test)]
+aic_best   <- model_comparison$Model[which.min(model_comparison$AIC)]
+rmse_gap   <- (max(model_comparison$RMSE_Test) - min(model_comparison$RMSE_Test)) /
+               min(model_comparison$RMSE_Test) * 100
+aic_lain   <- model_comparison[model_comparison$Model != aic_best, ]
+cat("RMSE testing terkecil:", rmse_best, "| AIC terkecil:", aic_best, "\n")
+```
+
+## Berdasarkan AIC
+
+```{r aic-values, include=FALSE}
+sel_ols   <- model_comparison$AIC[model_comparison$Model == "OLS"]
+sel_wls   <- model_comparison$AIC[model_comparison$Model == "WLS"]
+sel_gls   <- model_comparison$AIC[model_comparison$Model == "GLS"]
+sel_ridge <- model_comparison$AIC[model_comparison$Model == "Ridge"]
+teori_ar1 <- -n_train * log(1 - rho^2)    # keuntungan likelihood GLS untuk galat AR(1)
+```
+
+
+Model **`r aic_best`** memiliki AIC terkecil. Nilai AIC absolut tidak bermakna sendiri, sehingga yang dibaca adalah selisihnya ($\Delta$AIC): `r paste0(aic_lain$Model, " = ", format(round(aic_lain$Delta_AIC, 1), big.mark = ".", decimal.mark = ","), collapse = "; ")`. Selisih sebesar ratusan ribu jauh di atas batas lazim 10, sehingga dukungan data terhadap GLS **sangat kuat**.
+
+Besarnya selisih ini berasal dari autokorelasi. Untuk galat AR(1), keuntungan log-likelihood GLS atas OLS kira-kira $-n\ln(1-\hat\rho^2)$ = `r format(round(teori_ar1), big.mark = ".", decimal.mark = ",")` (dengan $n$ = `r format(n_train, big.mark = ".", decimal.mark = ",")` dan $\hat\rho$ = `r round(rho, 4)`), sangat dekat dengan selisih AIC OLS dan GLS yang teramati, yaitu `r format(round(sel_ols - sel_gls), big.mark = ".", decimal.mark = ",")`. Jadi hampir seluruh keunggulan GLS berasal dari pemodelan autokorelasi.
+
+Sebaliknya, **OLS, WLS, dan Ridge praktis setara**. AIC WLS hanya `r round(sel_wls - sel_ols, 1)` lebih besar daripada OLS karena bobotnya hampir seragam dan tidak ada heteroskedastisitas, sehingga pembobotan tidak menambah apa pun. Selisih Ridge terhadap OLS hanya `r format(abs(sel_ridge - sel_ols), digits = 2)`, sebab penaltinya sangat kecil (derajat bebas efektif `r round(ridge_df, 2)` dari `r p`). Perbedaan peringkat di antara ketiganya karena itu tidak bermakna.
+
+AIC dihitung pada data training dan mengukur kecocokan model beserta kompleksitasnya, bukan akurasi prediksi pada data baru, yang dinilai lewat RMSE testing.
+
+
+## Berdasarkan RMSE Testing
+
+```{r rmse-values, include=FALSE}
+rmse_ols_te <- model_comparison$RMSE_Test[model_comparison$Model == "OLS"]
+r2_test     <- 1 - sum((y_test - ols_pred_test)^2) / sum((y_test - mean(y_test))^2)
+```
+
+Model dengan RMSE testing terkecil adalah **`r rmse_best`** (RMSE = `r format(min(model_comparison$RMSE_Test), nsmall = 6)`), sedangkan OLS = `r format(rmse_ols_te, nsmall = 6)`. Selisih antara model terbaik dan terburuk hanya `r format(max(model_comparison$RMSE_Test) - min(model_comparison$RMSE_Test), digits = 2)` atau `r format(rmse_gap, digits = 2)`%, jauh di bawah satu persen. Jadi keempat model **setara dalam akurasi prediksi**, dan peringkat RMSE di antara mereka tidak bermakna.
+
+RMSE testing (`r round(rmse_ols_te, 4)`) hampir sama dengan RMSE training OLS (`r round(rmse_ols_tr, 4)`), sehingga **tidak ada tanda *overfitting***. Pada data testing, model menjelaskan sekitar `r round(100 * r2_test, 1)`% variasi $Y$, dan RMSE-nya (`r round(rmse_ols_te, 2)`) hanya sedikit di bawah simpangan baku $Y$ testing (`r round(sd(y_test), 2)`). Artinya sebagian besar variasi $Y$ berasal dari galat yang tidak dapat dijelaskan oleh prediktor.
+
+Hasil yang sama untuk keempat model memang wajar. WLS dan GLS memperbaiki **efisiensi dan validitas inferensi** (galat baku, uji-$t$, p-value), bukan akurasi prediksi titik, karena prediksi tetap $X\hat\beta$ dan tidak memanfaatkan korelasi serial galat. WLS hampir tidak berbeda dari OLS karena bobotnya seragam. Ridge hampir identik dengan OLS bukan karena multikolinearitasnya lemah (VIF maksimum = `r round(max_vif, 1)`), tetapi karena $n$ sangat besar sehingga varians koefisien OLS sudah kecil dan penalti $\lambda$ = `r signif(lambda_min, 4)` nyaris tidak mengubah apa pun.
+
+
+## Kesimpulan
+
+```{r kesimpulan-values, include=FALSE}
+n_signif <- sum(c(dw_result$p.value, bg_result$p.value, lb_result$p.value) < 0.05)
+max_vif  <- max(vif_table$VIF)
+```
+
+
+| Asumsi | Uji | Hasil | Keputusan |
+|--------|-----|-------|-----------|
+| Normalitas sisaan | Shapiro-Wilk, Jarque-Bera | p = `r format.pval(shapiro_result$p.value, digits = 3)`; `r format.pval(p_jb, digits = 3)` | Tolak $H_0$ (tidak normal) |
+| Multikolinearitas | VIF | VIF maks = `r round(max_vif, 2)` | Kuat (27 dari 30 prediktor VIF > 10) |
+| Heteroskedastisitas | Breusch-Pagan | p = `r format.pval(bp_result$p.value, digits = 3)` | Gagal tolak $H_0$ (homoskedastik) |
+| Autokorelasi | DW, BG, Ljung-Box | $\hat\rho$ = `r round(rho_ols, 3)`; `r n_signif` dari 3 uji signifikan | Tolak $H_0$ (autokorelasi positif) |
+
+Dari keempat asumsi, **satu terpenuhi** (homoskedastisitas) dan **tiga dilanggar** (normalitas, multikolinearitas, dan autokorelasi). Pelanggaran yang paling besar dampaknya pada kecocokan model adalah **autokorelasi positif yang kuat** ($\hat\rho \approx 0{,}70$), yang terlihat dari selisih AIC antara GLS dan model lainnya. Autokorelasi membuat galat baku, uji-$t$, dan p-value koefisien OLS tidak dapat diandalkan, sehingga inferensi sebaiknya merujuk ke GLS yang memodelkannya. Multikolinearitas yang kuat (VIF maksimum `r round(max_vif, 1)`) membuat koefisien individual tidak stabil dan sulit ditafsirkan, meskipun tidak merusak kemampuan prediksi.
+
+Berdasarkan AIC, model terbaik adalah **`r aic_best`**, dengan selisih AIC terhadap OLS sebesar `r format(round(model_comparison$Delta_AIC[model_comparison$Model == "OLS"]), big.mark = ".", decimal.mark = ",")`. Selisih sebesar itu menunjukkan dukungan data yang sangat kuat bagi model yang memodelkan autokorelasi. Berdasarkan RMSE testing, model terkecil memang **`r rmse_best`**, tetapi selisih antar-model hanya `r format(max(model_comparison$RMSE_Test) - min(model_comparison$RMSE_Test), digits = 2)`, sehingga keempat model **setara dalam akurasi prediksi**. Perbaikan GLS ada pada kecocokan struktur galat dan validitas inferensi, bukan pada prediksi titik. WLS hampir tidak berbeda dari OLS karena tidak ada heteroskedastisitas, dan Ridge hampir identik dengan OLS karena $n$ sangat besar sehingga penaltinya kecil, meskipun multikolinearitasnya kuat.
+
+Jadi untuk **inferensi** gunakan GLS, dan untuk **prediksi** keempat model pada dasarnya sama baiknya sehingga model yang paling sederhana (OLS) sudah cukup.
+
+**Catatan keterbatasan.** (1) GLS dihitung sebagai FGLS (galat AR(1) digabung fungsi ragam terduga), sehingga parameter fungsi ragam tidak dihitung dalam $k$ AIC; dengan $n$ sebesar ini dampaknya sangat kecil. (2) Uji autokorelasi dan GLS mengandaikan urutan baris adalah urutan pengamatan. (3) AIC Ridge memakai derajat bebas efektif dan bersifat pendekatan. (4) Uji formal pada $n$ sangat besar hampir selalu signifikan, sehingga ukuran efek ($\hat\rho$, VIF, plot sisaan) perlu dibaca bersama p-value.
